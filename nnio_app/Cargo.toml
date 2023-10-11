@@ -1,0 +1,26 @@
+[package]
+name = "nnio_app"
+version = "0.1.0"
+edition = "2021"
+description = "nevermind_neu async tcp controller"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+name = "server"
+path = "src/server/main.rs"
+[[bin]]
+name = "client"
+path = "src/client/main.rs"
+
+[dependencies]
+# disable opencl cause of https://github.com/cogciprocate/ocl/issues/224
+nevermind-neu = { path = "../../regular_mind", features = ["mnist", "log_env_logger"], default-features = false }
+tokio = { version = "1.32.0", features = ["full"] }
+serde = { version = "1.0.188", features = ["derive"]}
+serde_json = "1.0.107"
+serde_yaml = "0.8"
+directories = "5.0.1"
+log = "0.4.20"
+env_logger = "0.10.0"
+dialoguer = "0.11.0"
+nnio_common = { path = "../nnio_common" }
