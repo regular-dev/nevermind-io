@@ -8,15 +8,18 @@ use std::{
 
 use nevermind_neu::{dataloader::*, models::*, orchestra::*, util::DataVec};
 use nnio_common::*;
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::{sync::Mutex, task};
-use serde_json::json;
+
+use crate::app::App;
 
 pub enum ModelMessage {
     // requests
     Train(Vec<LabeledEntry>),
     Eval(Vec<DataVec>),
-    Save(String), // version
+    SaveCfg, // version
+    SaveState(String),
     SetBatchSize(usize),
     Info, // model name
 
@@ -25,6 +28,7 @@ pub enum ModelMessage {
     TrainResult(HashMap<String, f64>),
     EvalResult(Vec<DataVec>),
     RespInfo(String),
+    RespSave(bool),
     Test,
     Stop,
 }
@@ -92,7 +96,8 @@ impl ModelStorage {
     }
 
     pub async fn get_model_info(&mut self, mdl_name: &String) -> Option<String> {
-        if let Some(mdl_cfg) = self.mdls.get_mut(mdl_name) { // if model config exists ?
+        if let Some(mdl_cfg) = self.mdls.get_mut(mdl_name) {
+            // if model config exists ?
             if let Some(mdl_con) = mdl_cfg {
                 mdl_con.sender.send(ModelMessage::Info).await.unwrap();
                 if let ModelMessage::RespInfo(resp) = mdl_con.recver.recv().await.unwrap() {
@@ -100,8 +105,28 @@ impl ModelStorage {
                 }
             }
         }
-        
+
         None
+    }
+
+    pub async fn save_model_cfg(&mut self, mdl_name: &String) -> Result<bool, NnioError> {
+        if let Some(mdl_cfg) = self.mdls.get_mut(mdl_name) {
+            // if model available
+            if let Some(mdl_con) = mdl_cfg {
+                mdl_con.sender.send(ModelMessage::SaveCfg).await.unwrap();
+                if let ModelMessage::RespSave(status) = mdl_con.recver.recv().await.unwrap() {
+                    return Ok(status);
+                } else {
+                    return Err(NnioError::ModelCommunication);
+                }
+            } else {
+                debug!("Trying to save not loaded model");
+                return Err(NnioError::ModelNotLoaded);
+            }
+        } else {
+            debug!("Trying to save non-existsing model {}", mdl_name);
+            return Err(NnioError::ModelNotExists);
+        }
     }
 
     pub async fn unload_model(&mut self, mdl_name: &String) {
@@ -118,7 +143,7 @@ impl ModelStorage {
                 match con {
                     Some(con) => {
                         // if model is loaded (there is a connection)
-                        con.sender.send(ModelMessage::Stop).await;
+                        con.sender.send(ModelMessage::Stop).await.unwrap();
                         con.handle.join().expect("Failed to join net thread"); // TODO : handle right
                     }
                     None => {}
@@ -128,14 +153,26 @@ impl ModelStorage {
         };
     }
 
-    pub async fn create_model(&mut self, net_cfg: String) -> Result<(), NnioError> {
+    pub async fn create_model(
+        &mut self,
+        net_cfg: String,
+        mdl_name: String,
+    ) -> Result<(), NnioError> {
+        if self.mdls.contains_key(&mdl_name) {
+            return Err(NnioError::ModelAlreadyExists);
+        }
+
         let (tx_host, mut rx_mdl) = mpsc::channel(20); // TODO : param must be in configuration
         let (tx_mdl, mut rx_host) = mpsc::channel(20);
 
         let handle = std::thread::spawn(move || {
             debug!("Creating model with yaml cfg : {}", net_cfg);
 
-            let mut orc = Orchestra::new(Sequential::from_yaml(net_cfg.as_str()).expect("Model yaml parse error"));
+            let mut orc = Orchestra::new(
+                Sequential::from_yaml(net_cfg.as_str()).expect("Model yaml parse error"),
+            );
+
+            orc.name = mdl_name;
 
             tx_mdl
                 .blocking_send(ModelMessage::ModelName(orc.name.clone()))
@@ -167,6 +204,23 @@ impl ModelStorage {
                     ModelMessage::Stop => {
                         debug!("Stopping model {}...", orc.name);
                         break;
+                    }
+                    ModelMessage::SaveCfg => {
+                        let mut app_path = App::get_app_dir();
+                        app_path.push("models/");
+                        app_path.push(orc.name.clone());
+
+                        std::fs::create_dir_all(app_path.clone()).expect("Failed to create model dir");
+
+                        app_path.push("net.cfg");
+                        
+                        let train_model = orc.train_model().expect("No train model");
+
+                        if let Ok(_) = train_model.to_file(app_path.to_str().unwrap()) {
+                            tx_mdl.blocking_send(ModelMessage::RespSave(true)).unwrap();
+                        } else {
+                            tx_mdl.blocking_send(ModelMessage::RespSave(false)).unwrap();
+                        }
                     }
                     _ => {
                         continue;

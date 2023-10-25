@@ -1,10 +1,13 @@
+use dialoguer::console::Color;
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 
-use std::{fs, str};
+use std::{fs, str, string};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use serde_json::{json, Value, Number};
+use serde_json::{json, Number, Value};
+
+use strum::IntoEnumIterator;
 
 use nnio_common::*;
 
@@ -41,19 +44,14 @@ async fn main() {
         .await
         .expect("Couldn't connect to server");
 
-    let cmds = &[
-        "get_available_models", // 0
-        "get_loaded_models",    // 1
-        "model_info",           // 2
-        "create_model",         // 3
-        "delete_model",         // 4
-        "load_model",           // 5
-        "unload_model",         // 6
-        "save_model",           // 7
-        "train_model",          // 8
-        "evaluate_data",        // 9
-        "exit",                 // 10
-    ];
+    let mut cmds_v = Vec::with_capacity(15);
+    for i in MessageType::iter() {
+        let c = i.to_string();
+
+        if !c.contains("Resp") {
+            cmds_v.push(c);
+        }
+    }
 
     let mut buffer = [0; 8192];
 
@@ -61,23 +59,50 @@ async fn main() {
         let cmd = Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Choose command")
             .default(0)
-            .items(&cmds[..])
+            .items(&cmds_v[..])
             .interact()
             .unwrap();
 
         if cmd == MessageType::LoadModel as usize {
             break;
-        }
+        } else if cmd == MessageType::GetAvailableModels as usize {
+            let msg_req = json!({
+                "type": MessageType::GetAvailableModels as usize,
+            });
 
-        if cmd == MessageType::ModelInfo as usize {
-            let mdl_name: String = Input::with_theme(&ColorfulTheme::default()).with_prompt("Enter loaded model name").interact_text().unwrap();
+            stream
+                .write_all(msg_req.to_string().as_bytes())
+                .await
+                .unwrap();
+
+            if let Ok(bytes_read) = stream.read(&mut buffer).await {
+                let json_recv: Value =
+                    serde_json::from_slice(&buffer[0..bytes_read]).expect("Failed to parse json");
+
+                if let Some(json_obj) = json_recv.as_object() {
+                    if let Value::Array(list_mdls) = json_obj.get("available_mdls").unwrap() {
+                        println!("Available models : ");
+                        for (idx, i) in list_mdls.iter().enumerate() {
+                            println!("{} : {}", idx, i.as_str().unwrap());
+                        }
+                    }
+                }
+            }
+        } else if cmd == MessageType::ModelInfo as usize {
+            let mdl_name: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Enter loaded model name")
+                .interact_text()
+                .unwrap();
 
             let msg_req = json!({
                 "type": MessageType::ModelInfo as usize,
                 "mdl_name": mdl_name,
             });
 
-            stream.write_all(msg_req.to_string().as_bytes()).await.unwrap();
+            stream
+                .write_all(msg_req.to_string().as_bytes())
+                .await
+                .unwrap();
 
             if let Ok(bytes_read) = stream.read(&mut buffer).await {
                 let json_recv: Value =
@@ -94,11 +119,14 @@ async fn main() {
                     }
                 }
             }
-        }
-
-        if cmd == MessageType::CreateModel as usize {
+        } else if cmd == MessageType::CreateModel as usize {
             let net_cfg_filepath: String = Input::with_theme(&ColorfulTheme::default())
                 .with_prompt("Input filepath of network configuration")
+                .interact_text()
+                .unwrap();
+
+            let mdl_name: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Input model name")
                 .interact_text()
                 .unwrap();
 
@@ -107,6 +135,7 @@ async fn main() {
             let msg = json!({
                 "type": MessageType::CreateModel as usize,
                 "net_cfg": cfg_file,
+                "name": mdl_name,
             });
 
             let msg_serialized = serde_json::to_string_pretty(&msg).unwrap();
@@ -122,7 +151,8 @@ async fn main() {
                     let msg_resp = m.get("type").unwrap();
 
                     if let Value::Number(msg_resp) = msg_resp {
-                        if msg_resp.as_u64().unwrap() == MessageType::RespModelCreateSuccess as u64 {
+                        if msg_resp.as_u64().unwrap() == MessageType::RespModelCreateSuccess as u64
+                        {
                             info!("Resp: model created successfully");
                         }
                     } else {
@@ -130,6 +160,42 @@ async fn main() {
                     }
                 }
             }
+        } else if cmd == MessageType::SaveModelCfg as usize {
+            let mdl_name: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Enter model name")
+                .interact_text()
+                .unwrap();
+
+            let msg = json!({
+                "type": MessageType::SaveModelCfg as usize,
+                "mdl_name": mdl_name,
+            });
+
+            stream.write_all(msg.to_string().as_bytes()).await.unwrap();
+
+            if let Ok(bytes_read) = stream.read(&mut buffer).await {
+                let json_recv: Value =
+                    serde_json::from_slice(&buffer[0..bytes_read]).expect("Failed to parse json");
+
+                if let Value::Object(m) = json_recv {
+                    let msg_resp = m.get("type").unwrap().as_number().unwrap();
+
+                    if msg_resp.as_u64().unwrap() == MessageType::RespModelSaveCfg as u64 {
+                        let msg_status = m
+                            .get("status")
+                            .unwrap()
+                            .as_u64()
+                            .unwrap();
+
+                        if msg_status == 0 {
+                            info!("Model {} cfg saved !", mdl_name);
+                        }
+                    }
+                }
+            }
+        } else if cmd == MessageType::Exit as usize {
+            info!("Exiting...");
+            break;
         }
     }
 }

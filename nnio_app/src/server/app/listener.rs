@@ -7,9 +7,10 @@ use std::sync::{
 use tokio::{
     io::*,
     net::{TcpListener, TcpStream},
+    sync::mpsc,
 };
 
-use serde_json::{json, Result, Value};
+use serde_json::{json, Value};
 
 use crate::app::*;
 use nnio_common::*;
@@ -27,7 +28,7 @@ impl Listener {
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&mut self, mut shutdown_rx: mpsc::Receiver<()>) {
         if self.is_running.load(Ordering::SeqCst) {
             return;
         }
@@ -38,13 +39,21 @@ impl Listener {
         info!("Server is listening on {}", addr);
 
         loop {
-            let (socket, _) = listener.accept().await.unwrap();
+            tokio::select! {
+                vals = listener.accept() => {
+                    let (socket, _) = vals.unwrap();
 
-            let mdls = self.app.clone_model_storage();
+                    let mdls = self.app.clone_model_storage();
 
-            tokio::spawn(async move {
-                Listener::handle_client(socket, mdls).await;
-            });
+                    tokio::spawn(async move {
+                        Listener::handle_client(socket, mdls).await;
+                    });
+                },
+                _ = shutdown_rx.recv() => {
+                    info!("Graceful shutdown");
+                    break;
+                }
+            }
         }
     }
 
@@ -60,7 +69,13 @@ impl Listener {
             let input_slice = &buffer[..bytes_read];
             let mut json_msg: Value = serde_json::from_slice(input_slice).unwrap();
 
-            if let Some(str_msg_type) = json_msg["type"].as_u64() {
+            if !json_msg.is_object() {
+                continue;
+            }
+
+            let json_obj = json_msg.as_object_mut().unwrap();
+
+            if let Some(str_msg_type) = json_obj.get("type").unwrap().as_u64() {
                 let msg_type_res = MessageType::try_from(str_msg_type);
 
                 debug!("Received message : {}", str_msg_type);
@@ -71,24 +86,33 @@ impl Listener {
                             debug!("in create model");
                             let mut lock = mdls.lock().await;
 
-                            if let Some(json_obj) = json_msg.as_object_mut() {
-                                if let Value::String(net_cfg) = json_obj.remove("net_cfg").unwrap()
-                                {
-                                    if let Ok(_) = lock.create_model(net_cfg).await {
-                                        let resp = json!({
-                                            "type": MessageType::RespModelCreateSuccess as usize
-                                        });
+                            let mdl_name = json_obj
+                                .remove("name")
+                                .unwrap()
+                                .as_str()
+                                .unwrap()
+                                .to_owned();
 
-                                        let resp_ser = serde_json::to_string(&resp).unwrap();
-                                        stream.write_all(resp_ser.as_bytes()).await.unwrap();
-                                    } else {
-                                        let resp = json!({
-                                            "type": MessageType::RespModelCreateFailure as usize
-                                        });
+                            if mdl_name.is_empty() {
+                                warn!("Received model name is empty, ignoring...");
+                                continue;
+                            }
 
-                                        let resp_ser = serde_json::to_string(&resp).unwrap();
-                                        stream.write_all(resp_ser.as_bytes()).await.unwrap();
-                                    }
+                            if let Value::String(net_cfg) = json_obj.remove("net_cfg").unwrap() {
+                                if let Ok(_) = lock.create_model(net_cfg, mdl_name).await {
+                                    let resp = json!({
+                                        "type": MessageType::RespModelCreateSuccess as usize
+                                    });
+
+                                    let resp_ser = serde_json::to_string(&resp).unwrap();
+                                    stream.write_all(resp_ser.as_bytes()).await.unwrap();
+                                } else {
+                                    let resp = json!({
+                                        "type": MessageType::RespModelCreateFailure as usize
+                                    });
+
+                                    let resp_ser = serde_json::to_string(&resp).unwrap();
+                                    stream.write_all(resp_ser.as_bytes()).await.unwrap();
                                 }
                             }
                         }
@@ -97,11 +121,18 @@ impl Listener {
                             let lock = mdls.lock().await;
                             let out = lock.get_availabel_models();
 
-                            let json_ser =
+                            let json_mdls =
                                 out.iter().map(|s| json!(s)).collect::<serde_json::Value>();
-                            let json_ser = json_ser.to_string();
 
-                            stream.write_all(json_ser.as_bytes()).await.unwrap();
+                            let json_resp = json!({
+                                "type": MessageType::RespAvailableModels as usize,
+                                "available_mdls": json_mdls,
+                            });
+
+                            stream
+                                .write_all(json_resp.to_string().as_bytes())
+                                .await
+                                .unwrap();
                         }
                         MessageType::GetLoadedModels => {
                             let lock = mdls.lock().await;
@@ -114,31 +145,69 @@ impl Listener {
                         }
                         MessageType::TrainModel => {}
                         MessageType::ModelInfo => {
-                            if let Some(json_obj) = json_msg.as_object_mut() {
-                                if let Value::String(mdl_name) = json_obj.get("mdl_name").unwrap() {
-                                    let mut lock = mdls.lock().await;
-                                    if let Some(mdl_info) = lock.get_model_info(mdl_name).await {
-                                        let json_resp = json!({
-                                            "type": MessageType::RespModelInfoSuccess as usize,
-                                            "mdl_info": mdl_info
-                                        });
+                            if let Value::String(mdl_name) = json_obj.get("mdl_name").unwrap() {
+                                let mut lock = mdls.lock().await;
+                                if let Some(mdl_info) = lock.get_model_info(mdl_name).await {
+                                    let json_resp = json!({
+                                        "type": MessageType::RespModelInfoSuccess as usize,
+                                        "mdl_info": mdl_info
+                                    });
 
-                                        stream
-                                            .write_all(json_resp.to_string().as_bytes())
-                                            .await
-                                            .unwrap();
-                                    } else {
-                                        let json_resp = json!({
-                                            "type": MessageType::RespModelCreateFailure as usize,
-                                        });
+                                    stream
+                                        .write_all(json_resp.to_string().as_bytes())
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    let json_resp = json!({
+                                        "type": MessageType::RespModelCreateFailure as usize,
+                                    });
 
-                                        stream
-                                            .write_all(json_resp.to_string().as_bytes())
-                                            .await
-                                            .unwrap();
-                                    }
+                                    stream
+                                        .write_all(json_resp.to_string().as_bytes())
+                                        .await
+                                        .unwrap();
                                 }
                             }
+                        }
+                        MessageType::SaveModelCfg => {
+                            let mdl_name = json_obj
+                                .get("mdl_name")
+                                .unwrap()
+                                .as_str()
+                                .unwrap()
+                                .to_owned();
+
+                            debug!("Trying to save cfg of model {}", mdl_name);
+
+                            let mut lock = mdls.lock().await;
+
+                            let res = lock.save_model_cfg(&mdl_name).await;
+
+                            match res {
+                                Ok(status) => {
+                                    let json_resp = json!({
+                                        "type": MessageType::RespModelSaveCfg as usize,
+                                        "status": status as usize,
+                                    });
+
+                                    stream
+                                        .write_all(json_resp.to_string().as_bytes())
+                                        .await
+                                        .unwrap();
+                                }
+                                Err(_) => {
+                                    // TODO : handle err type
+                                    let json_resp = json!({
+                                        "type": MessageType::RespModelSaveCfg as usize,
+                                        "status": 0,
+                                    });
+
+                                    stream
+                                        .write_all(json_resp.to_string().as_bytes())
+                                        .await
+                                        .unwrap();
+                                }
+                            };
                         }
                         MessageType::EvaluateData => {}
                         _ => {
