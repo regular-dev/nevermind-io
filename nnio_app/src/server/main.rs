@@ -2,7 +2,6 @@ pub mod app;
 
 use std::{error::Error, thread};
 
-use signal_hook::{consts::SIGINT, iterator::Signals};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
