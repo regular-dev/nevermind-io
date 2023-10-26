@@ -19,8 +19,6 @@ use nevermind_neu::{
 
 use tokio::sync::Mutex;
 
-use super::mdl_storage;
-
 #[derive(Serialize, Deserialize)]
 pub struct Configuration {
     pub net_port: u16,

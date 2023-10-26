@@ -76,14 +76,13 @@ async fn main() {
                 .unwrap();
 
             if let Ok(bytes_read) = stream.read(&mut buffer).await {
-                let json_recv: Value =
-                    serde_json::from_slice(&buffer[0..bytes_read]).expect("Failed to parse json");
-
-                if let Some(json_obj) = json_recv.as_object() {
-                    if let Value::Array(list_mdls) = json_obj.get("available_mdls").unwrap() {
-                        println!("Available models : ");
-                        for (idx, i) in list_mdls.iter().enumerate() {
-                            println!("{} : {}", idx, i.as_str().unwrap());
+                if let Ok(json_recv) = serde_json::from_slice::<Value>(&buffer[0..bytes_read]) {
+                    if let Some(json_obj) = json_recv.as_object() {
+                        if let Value::Array(list_mdls) = json_obj.get("available_mdls").unwrap() {
+                            println!("Available models : ");
+                            for (idx, i) in list_mdls.iter().enumerate() {
+                                println!("{} : {}", idx, i.as_str().unwrap());
+                            }
                         }
                     }
                 }
@@ -144,19 +143,19 @@ async fn main() {
             stream.write_all(msg_serialized.as_bytes()).await.unwrap();
 
             if let Ok(bytes_read) = stream.read(&mut buffer).await {
-                let json_recv: Value =
-                    serde_json::from_slice(&buffer[0..bytes_read]).expect("Failed to parse json");
+                if let Ok(json_recv) = serde_json::from_slice(&buffer[0..bytes_read]) {
+                    if let Value::Object(m) = json_recv {
+                        let msg_resp = m.get("type").unwrap();
 
-                if let Value::Object(m) = json_recv {
-                    let msg_resp = m.get("type").unwrap();
-
-                    if let Value::Number(msg_resp) = msg_resp {
-                        if msg_resp.as_u64().unwrap() == MessageType::RespModelCreateSuccess as u64
-                        {
-                            info!("Resp: model created successfully");
+                        if let Value::Number(msg_resp) = msg_resp {
+                            if msg_resp.as_u64().unwrap()
+                                == MessageType::RespModelCreateSuccess as u64
+                            {
+                                info!("Resp: model created successfully");
+                            }
+                        } else {
+                            warn!("Resp: model creation failure");
                         }
-                    } else {
-                        warn!("Resp: model creation failure");
                     }
                 }
             }
@@ -181,11 +180,7 @@ async fn main() {
                     let msg_resp = m.get("type").unwrap().as_number().unwrap();
 
                     if msg_resp.as_u64().unwrap() == MessageType::RespModelSaveCfg as u64 {
-                        let msg_status = m
-                            .get("status")
-                            .unwrap()
-                            .as_u64()
-                            .unwrap();
+                        let msg_status = m.get("status").unwrap().as_u64().unwrap();
 
                         if msg_status == 0 {
                             info!("Model {} cfg saved !", mdl_name);

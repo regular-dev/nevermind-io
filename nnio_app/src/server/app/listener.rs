@@ -2,7 +2,7 @@ use nevermind_neu::{models::Sequential, orchestra::Orchestra};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use tokio::{
     io::*,
@@ -57,6 +57,7 @@ impl Listener {
         }
     }
 
+    // TODO : splitup each enum entry per func, increase readability
     async fn handle_client(mut stream: TcpStream, mdls: MutexedModelStorage) {
         let mut buffer = [0; 8192];
         while let Ok(bytes_read) = stream.read(&mut buffer).await {
@@ -99,7 +100,8 @@ impl Listener {
                             }
 
                             if let Value::String(net_cfg) = json_obj.remove("net_cfg").unwrap() {
-                                if let Ok(_) = lock.create_model(net_cfg, mdl_name).await {
+                                // TODO : handle rewrite flag (third arg)
+                                if let Ok(_) = lock.create_model(net_cfg, mdl_name, false).await {
                                     let resp = json!({
                                         "type": MessageType::RespModelCreateSuccess as usize
                                     });
@@ -138,10 +140,24 @@ impl Listener {
                             let lock = mdls.lock().await;
                             let out = lock.get_loaded_models();
 
-                            todo!("Send serialized out to client");
+                            let json_mdls =
+                                out.iter().map(|s| json!(s)).collect::<serde_json::Value>();
+
+                            let json_resp = json!({
+                                "type": MessageType::RespLoadedModels as usize,
+                                "loaded_mdls": json_mdls
+                            });
+
+                            stream
+                                .write_all(json_resp.to_string().as_bytes())
+                                .await
+                                .unwrap();
                         }
                         MessageType::UnloadModel => {
                             let mut lock = mdls.lock().await;
+                        }
+                        MessageType::LoadModel => {
+                            Listener::handle_load_model(&mut stream, mdls.clone(), json_obj).await;
                         }
                         MessageType::TrainModel => {}
                         MessageType::ModelInfo => {
@@ -219,6 +235,44 @@ impl Listener {
 
             // Echo the data back to the client
             // stream.write_all(received_data).unwrap();
+        }
+    }
+
+    async fn handle_load_model(
+        stream: &mut TcpStream,
+        mdls: MutexedModelStorage,
+        json_obj: &mut serde_json::Map<String, Value>,
+    ) {
+        let mut lock = mdls.lock().await;
+        let mdl_name = json_obj
+            .get("mdl_name")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        if let Ok(_) = lock.load_model(mdl_name).await {
+            stream
+                .write_all(
+                    json!({
+                        "type": MessageType::RespLoadModel as usize,
+                        "status": 1,
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .await;
+        } else {
+            stream
+                .write_all(
+                    json!({
+                        "type": MessageType::RespLoadModel as usize,
+                        "status": 0
+                    })
+                    .to_string()
+                    .as_bytes(),
+                )
+                .await;
         }
     }
 }

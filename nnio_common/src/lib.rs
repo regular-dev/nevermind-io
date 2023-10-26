@@ -1,4 +1,4 @@
-use strum_macros::EnumIter;
+use strum_macros::{EnumIter, Display};
 
 #[derive(Debug, EnumIter)]
 pub enum MessageType {
@@ -21,6 +21,8 @@ pub enum MessageType {
     RespModelInfoSuccess,
     RespModelInfoFailure,
     RespAvailableModels,
+    RespLoadModel,
+    RespLoadedModels,
     RespModelInfo,
     RespModelSaveCfg,
 }
@@ -91,7 +93,7 @@ impl TryFrom<u64> for MessageType {
     }
 }
 
-use std::fmt;
+use std::{fmt, error::Error};
 
 #[derive(Debug)]
 pub enum NnioError {
@@ -99,6 +101,7 @@ pub enum NnioError {
     ModelAlreadyExists,
     ModelCommunication,
     ModelNotLoaded,
+    ModelAlreadyLoaded,
     CustomError(String),
 
 }
@@ -115,4 +118,6 @@ impl fmt::Display for NnioError {
         }
     }
 }
+
+impl Error for NnioError {}
 

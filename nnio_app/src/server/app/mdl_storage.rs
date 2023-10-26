@@ -4,12 +4,13 @@ use std::{
     path::PathBuf,
     sync::Arc,
     thread::{self, JoinHandle},
+    error::Error
 };
 
 use nevermind_neu::{dataloader::*, models::*, orchestra::*, util::DataVec};
 use nnio_common::*;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, io::AsyncWriteExt};
 use tokio::{sync::Mutex, task};
 
 use crate::app::App;
@@ -153,98 +154,137 @@ impl ModelStorage {
         };
     }
 
+    pub async fn load_model(&mut self, mdl_name: String) -> Result<(), NnioError> {
+        if let Some(con) = self.mdls.get_mut(&mdl_name) { // if model is available
+            if let Some(_) = con {
+                warn!("Trying to load a loaded {} model", mdl_name);
+                return Err(NnioError::ModelAlreadyLoaded);
+            } else {
+                let mut cfgfile = App::get_app_dir();
+                cfgfile.push("models");
+                cfgfile.push(mdl_name.clone());
+                cfgfile.push("mdl.cfg");
+
+                let mdl_yaml = tokio::fs::read_to_string(cfgfile).await.unwrap();
+
+                debug!("Readed {} model yaml", mdl_name);
+
+                let (tx_host, mut rx_mdl) = mpsc::channel(20); // TODO : param must be in configuration
+                let (tx_mdl, rx_host) = mpsc::channel(20);
+
+                info!("Loading {} model...", mdl_name);
+
+                let handle = std::thread::spawn(move || {
+                    debug!("Creating model with yaml cfg : {}", mdl_yaml);
+
+                    let mut orc = Orchestra::new(
+                        Sequential::from_yaml(mdl_yaml.as_str()).expect("Model yaml parse error"),
+                    );
+
+                    orc.name = mdl_name;
+
+                    tx_mdl
+                        .blocking_send(ModelMessage::ModelName(orc.name.clone()))
+                        .unwrap();
+
+                    while let Some(msg) = rx_mdl.blocking_recv() {
+                        match msg {
+                            ModelMessage::Train(_) => {
+                                todo!("Train model")
+                            }
+                            ModelMessage::SetBatchSize(batch_size) => {
+                                // orc.set_train_batch_size(batch_size);
+                            }
+                            ModelMessage::Eval(_) => {
+                                todo!("Eval")
+                            }
+                            ModelMessage::Info => {
+                                let mdl = orc.train_model().unwrap();
+                                let mut out = String::with_capacity(mdl.layers_count() * 2);
+
+                                for l in 0..mdl.layers_count() {
+                                    out += format!("{}-", mdl.layer(l).size()).as_str();
+                                }
+
+                                out.pop();
+
+                                tx_mdl.blocking_send(ModelMessage::RespInfo(out)).unwrap();
+                            }
+                            ModelMessage::Stop => {
+                                debug!("Stopping model {}...", orc.name);
+                                break;
+                            }
+                            ModelMessage::SaveCfg => {
+                                let mut app_path = App::get_app_dir();
+                                app_path.push("models/");
+                                app_path.push(orc.name.clone());
+
+                                std::fs::create_dir_all(app_path.clone())
+                                    .expect("Failed to create model dir");
+
+                                app_path.push("net.cfg");
+
+                                let train_model = orc.train_model().expect("No train model");
+
+                                if let Ok(_) = train_model.to_file(app_path.to_str().unwrap()) {
+                                    tx_mdl.blocking_send(ModelMessage::RespSave(true)).unwrap();
+                                } else {
+                                    tx_mdl.blocking_send(ModelMessage::RespSave(false)).unwrap();
+                                }
+                            }
+                            _ => {
+                                continue;
+                            }
+                        }
+                    }
+                });
+
+                *con = Some(LocalConnection {
+                    recver: rx_host,
+                    sender: tx_host,
+                    handle,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn create_model(
         &mut self,
         net_cfg: String,
         mdl_name: String,
+        overwrite: bool,
     ) -> Result<(), NnioError> {
+        // write yaml config to folder-file
+        // create an entry
+        let mut cfgfile = App::get_app_dir();
+        cfgfile.push("models");
+        cfgfile.push(mdl_name.clone());
+
+        if !tokio::fs::try_exists(cfgfile.clone()).await.unwrap() { // model directory exists ?
+            tokio::fs::create_dir_all(cfgfile.clone()).await.unwrap();
+        }
+
+        cfgfile.push("mdl.cfg");
+
         if self.mdls.contains_key(&mdl_name) {
-            return Err(NnioError::ModelAlreadyExists);
-        }
-
-        let (tx_host, mut rx_mdl) = mpsc::channel(20); // TODO : param must be in configuration
-        let (tx_mdl, mut rx_host) = mpsc::channel(20);
-
-        let handle = std::thread::spawn(move || {
-            debug!("Creating model with yaml cfg : {}", net_cfg);
-
-            let mut orc = Orchestra::new(
-                Sequential::from_yaml(net_cfg.as_str()).expect("Model yaml parse error"),
-            );
-
-            orc.name = mdl_name;
-
-            tx_mdl
-                .blocking_send(ModelMessage::ModelName(orc.name.clone()))
-                .unwrap();
-
-            while let Some(msg) = rx_mdl.blocking_recv() {
-                match msg {
-                    ModelMessage::Train(_) => {
-                        todo!("Train model")
-                    }
-                    ModelMessage::SetBatchSize(batch_size) => {
-                        // orc.set_train_batch_size(batch_size);
-                    }
-                    ModelMessage::Eval(_) => {
-                        todo!("Eval")
-                    }
-                    ModelMessage::Info => {
-                        let mdl = orc.train_model().unwrap();
-                        let mut out = String::with_capacity(mdl.layers_count() * 2);
-
-                        for l in 0..mdl.layers_count() {
-                            out += format!("{}-", mdl.layer(l).size()).as_str();
-                        }
-
-                        out.pop();
-
-                        tx_mdl.blocking_send(ModelMessage::RespInfo(out)).unwrap();
-                    }
-                    ModelMessage::Stop => {
-                        debug!("Stopping model {}...", orc.name);
-                        break;
-                    }
-                    ModelMessage::SaveCfg => {
-                        let mut app_path = App::get_app_dir();
-                        app_path.push("models/");
-                        app_path.push(orc.name.clone());
-
-                        std::fs::create_dir_all(app_path.clone()).expect("Failed to create model dir");
-
-                        app_path.push("net.cfg");
-                        
-                        let train_model = orc.train_model().expect("No train model");
-
-                        if let Ok(_) = train_model.to_file(app_path.to_str().unwrap()) {
-                            tx_mdl.blocking_send(ModelMessage::RespSave(true)).unwrap();
-                        } else {
-                            tx_mdl.blocking_send(ModelMessage::RespSave(false)).unwrap();
-                        }
-                    }
-                    _ => {
-                        continue;
-                    }
+            if !overwrite {
+                return Err(NnioError::ModelAlreadyExists);
+            } else {
+                if tokio::fs::try_exists(cfgfile.clone()).await.unwrap() {
+                    tokio::fs::remove_file(cfgfile.clone()).await.unwrap();
                 }
+
+                // TODO : impl rewrite model (stop -> delete file -> ...)
             }
-        });
-
-        let mdl_name = rx_host.recv().await.unwrap();
-
-        if let ModelMessage::ModelName(mdl_name) = mdl_name {
-            self.mdls.insert(
-                mdl_name,
-                Some(LocalConnection {
-                    recver: rx_host,
-                    sender: tx_host,
-                    handle,
-                }),
-            );
-            Ok(())
-        } else {
-            Err(NnioError::CustomError(
-                "Invalid net initialization".to_owned(),
-            ))
         }
+
+        let mut file = tokio::fs::File::create(cfgfile).await.unwrap();
+        file.write(net_cfg.as_bytes()).await.unwrap();
+
+        self.mdls.insert(mdl_name, None);
+
+        Ok(())
     }
 }
